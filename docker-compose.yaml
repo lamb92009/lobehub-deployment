@@ -1,0 +1,123 @@
+services:
+  postgresql:
+    image: paradedb/paradedb:latest-pg17
+    volumes:
+      - 'pg_data:/var/lib/postgresql/data'
+    environment:
+      - 'POSTGRES_DB=${LOBE_DB_NAME}'
+      - 'POSTGRES_PASSWORD=${POSTGRES_PASSWORD}'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: always
+    networks:
+      - lobe-network
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save 60 1000 --appendonly yes
+    volumes:
+      - 'redis_data:/data'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: always
+    networks:
+      - lobe-network
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    environment:
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY}
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9000/health >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    command: ["--access-key","${RUSTFS_ACCESS_KEY}","--secret-key","${RUSTFS_SECRET_KEY}","/data"]
+    restart: always
+    networks:
+      - lobe-network
+
+  rustfs-init:
+    image: minio/mc:latest
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command: -c '
+        set -x;
+        echo "Waiting for RustFS to be fully ready...";
+        sleep 3;
+        echo "Initializing RustFS buckets...";
+        mc alias set rustfs "http://rustfs:9000" "${RUSTFS_ACCESS_KEY}" "${RUSTFS_SECRET_KEY}" || true;
+        mc mb "rustfs/lobe" --ignore-existing || true;
+        echo "{\"ID\":\"\",\"Statement\":[{\"Sid\":\"\",\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::lobe/*\"]}],\"Version\":\"2012-10-17\"}" > /tmp/bucket.json;
+        mc anonymous set-json /tmp/bucket.json "rustfs/lobe" || true;
+        echo "RustFS initialization complete";
+        exit 0;
+      '
+    restart: "no"
+    networks:
+      - lobe-network
+
+  searxng:
+    image: searxng/searxng
+    restart: always
+    networks:
+      - lobe-network
+
+  lobehub:
+    image: lobehub/lobehub
+    ports:
+      - '3210:3210'
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      rustfs:
+        condition: service_healthy
+      rustfs-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      - 'KEY_VAULTS_SECRET=${KEY_VAULTS_SECRET}'
+      - 'AUTH_SECRET=${AUTH_SECRET}'
+      - 'DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgresql:5432/${LOBE_DB_NAME}'
+      - 'S3_ENDPOINT=http://rustfs:9000'
+      - 'S3_BUCKET=${RUSTFS_LOBE_BUCKET}'
+      - 'S3_ENABLE_PATH_STYLE=1'
+      - 'S3_ACCESS_KEY=${RUSTFS_ACCESS_KEY}'
+      - 'S3_ACCESS_KEY_ID=${RUSTFS_ACCESS_KEY}'
+      - 'S3_SECRET_ACCESS_KEY=${RUSTFS_SECRET_KEY}'
+      - 'LLM_VISION_IMAGE_USE_BASE64=1'
+      - 'S3_SET_ACL=0'
+      - 'SEARXNG_URL=http://searxng:8080'
+      - 'REDIS_URL=redis://redis:6379'
+      - 'REDIS_PREFIX=lobechat'
+      - 'REDIS_TLS=0'
+      - 'APP_URL=${APP_URL}'
+      - 'JWKS_KEY=${JWKS_KEY}'
+    restart: always
+    networks:
+      - lobe-network
+
+volumes:
+  pg_data:
+    driver: local
+  redis_data:
+    driver: local
+  rustfs-data:
+    driver: local
+
+networks:
+  lobe-network:
+    driver: bridge
